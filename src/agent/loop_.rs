@@ -2942,55 +2942,26 @@ pub async fn run(
     } else {
         println!("🦀 ZeroClaw Interactive Mode");
         println!("Type /help for commands.\n");
-        let cli = crate::channels::CliChannel::new();
+
+        let history_path = config.workspace_dir.join("history.txt");
+        let (mut repl_rx, repl_printer) = super::repl::Repl::spawn(history_path);
 
         // Persistent conversation history across turns
         let mut history = vec![ChatMessage::system(&system_prompt)];
 
-        loop {
-            print!("> ");
-            let _ = std::io::stdout().flush();
+        while let Some(event) = repl_rx.recv().await {
+            let user_input = match event {
+                super::repl::ReplEvent::Line(line) => line,
+            };
 
-            let mut input = String::new();
-            match std::io::stdin().read_line(&mut input) {
-                Ok(0) => break,
-                Ok(_) => {}
-                Err(e) => {
-                    eprintln!("\nError reading input: {e}\n");
-                    break;
-                }
-            }
-
-            let user_input = input.trim().to_string();
-            if user_input.is_empty() {
-                continue;
-            }
             match user_input.as_str() {
                 "/quit" | "/exit" => break,
                 "/help" => {
-                    println!("Available commands:");
-                    println!("  /help        Show this help message");
-                    println!("  /clear /new  Clear conversation history");
-                    println!("  /quit /exit  Exit interactive mode\n");
+                    let _ = repl_printer.print("Available commands:\n  /help        Show this help message\n  /clear /new  Clear conversation history\n  /quit /exit  Exit interactive mode\n".to_string());
                     continue;
                 }
                 "/clear" | "/new" => {
-                    println!(
-                        "This will clear the current conversation and delete all session memory."
-                    );
-                    println!("Core memories (long-term facts/preferences) will be preserved.");
-                    print!("Continue? [y/N] ");
-                    let _ = std::io::stdout().flush();
-
-                    let mut confirm = String::new();
-                    if std::io::stdin().read_line(&mut confirm).is_err() {
-                        continue;
-                    }
-                    if !matches!(confirm.trim().to_lowercase().as_str(), "y" | "yes") {
-                        println!("Cancelled.\n");
-                        continue;
-                    }
-
+                    // Confirmation already handled on the reedline thread
                     history.clear();
                     history.push(ChatMessage::system(&system_prompt));
                     // Clear conversation and daily memory
@@ -3003,11 +2974,12 @@ pub async fn run(
                             }
                         }
                     }
-                    if cleared > 0 {
-                        println!("Conversation cleared ({cleared} memory entries removed).\n");
+                    let msg = if cleared > 0 {
+                        format!("Conversation cleared ({cleared} memory entries removed).\n")
                     } else {
-                        println!("Conversation cleared.\n");
-                    }
+                        "Conversation cleared.\n".to_string()
+                    };
+                    let _ = repl_printer.print(msg);
                     continue;
                 }
                 _ => {}
@@ -3060,19 +3032,12 @@ pub async fn run(
             {
                 Ok(resp) => resp,
                 Err(e) => {
-                    eprintln!("\nError: {e}\n");
+                    let _ = repl_printer.print(format!("\nError: {e}\n"));
                     continue;
                 }
             };
             final_output = response.clone();
-            if let Err(e) = crate::channels::Channel::send(
-                &cli,
-                &crate::channels::traits::SendMessage::new(format!("\n{response}\n"), "user"),
-            )
-            .await
-            {
-                eprintln!("\nError sending CLI response: {e}\n");
-            }
+            let _ = repl_printer.print(format!("\n{response}\n"));
             observer.record_event(&ObserverEvent::TurnComplete);
 
             // Auto-compaction before hard trimming to preserve long-context signal.
@@ -3085,7 +3050,7 @@ pub async fn run(
             .await
             {
                 if compacted {
-                    println!("🧹 Auto-compaction complete");
+                    let _ = repl_printer.print("🧹 Auto-compaction complete".to_string());
                 }
             }
 
