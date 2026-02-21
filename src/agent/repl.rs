@@ -1,14 +1,16 @@
 use reedline::{
     default_emacs_keybindings, ColumnarMenu, Completer, DefaultPrompt, DefaultPromptSegment,
-    EditCommand, Emacs, ExternalPrinter, FileBackedHistory, KeyCode, KeyModifiers, MenuBuilder,
-    Reedline, ReedlineEvent, ReedlineMenu, Signal, Span, Suggestion,
+    EditCommand, Emacs, FileBackedHistory, KeyCode, KeyModifiers, MenuBuilder, Reedline,
+    ReedlineEvent, ReedlineMenu, Signal, Span, Suggestion,
 };
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 
 /// Events sent from the reedline thread to the async agent loop.
 pub enum ReplEvent {
-    Line(String),
+    /// A line of user input, plus a channel to send output back.
+    /// The reedline thread blocks until the sender is dropped.
+    Line(String, std::sync::mpsc::Sender<String>),
 }
 
 /// Slash-command tab completer.
@@ -58,27 +60,23 @@ pub struct Repl;
 impl Repl {
     /// Spawn the reedline editor on a dedicated OS thread.
     ///
-    /// Returns a receiver for user input events and an `ExternalPrinter`
-    /// that can print output without corrupting the prompt.
-    pub fn spawn(
-        history_path: PathBuf,
-    ) -> (mpsc::UnboundedReceiver<ReplEvent>, ExternalPrinter<String>) {
+    /// Returns a receiver for user input events. Each event includes a
+    /// response channel — the reedline thread blocks until it is dropped,
+    /// printing every message it receives before returning to the prompt.
+    pub fn spawn(history_path: PathBuf) -> mpsc::UnboundedReceiver<ReplEvent> {
         let (tx, rx) = mpsc::unbounded_channel();
-        let printer = ExternalPrinter::default();
-        let printer_clone = printer.clone();
 
         std::thread::spawn(move || {
-            run_reedline(tx, printer_clone, history_path);
+            run_reedline(tx, history_path);
         });
 
-        (rx, printer)
+        rx
     }
 }
 
-fn run_reedline(tx: mpsc::UnboundedSender<ReplEvent>, printer: ExternalPrinter<String>, history_path: PathBuf) {
+fn run_reedline(tx: mpsc::UnboundedSender<ReplEvent>, history_path: PathBuf) {
     let history = Box::new(
-        FileBackedHistory::with_file(1000, history_path)
-            .expect("failed to open history file"),
+        FileBackedHistory::with_file(1000, history_path).expect("failed to open history file"),
     );
 
     let completer = Box::new(SlashCommandCompleter::new());
@@ -93,7 +91,6 @@ fn run_reedline(tx: mpsc::UnboundedSender<ReplEvent>, printer: ExternalPrinter<S
             ReedlineEvent::MenuNext,
         ]),
     );
-    // Ctrl+D sends EOF (Ctrl+C is already handled by reedline as Signal::CtrlC)
     keybindings.add_binding(
         KeyModifiers::CONTROL,
         KeyCode::Char('d'),
@@ -111,8 +108,7 @@ fn run_reedline(tx: mpsc::UnboundedSender<ReplEvent>, printer: ExternalPrinter<S
         .with_history(history)
         .with_completer(completer)
         .with_menu(ReedlineMenu::EngineCompleter(completion_menu))
-        .with_edit_mode(edit_mode)
-        .with_external_printer(printer);
+        .with_edit_mode(edit_mode);
 
     loop {
         match editor.read_line(&prompt) {
@@ -150,8 +146,17 @@ fn run_reedline(tx: mpsc::UnboundedSender<ReplEvent>, printer: ExternalPrinter<S
                     }
                 }
 
-                if tx.send(ReplEvent::Line(trimmed)).is_err() {
+                // Create a response channel — we block here until the async
+                // side is done processing (drops the sender).
+                let (resp_tx, resp_rx) = std::sync::mpsc::channel();
+
+                if tx.send(ReplEvent::Line(trimmed, resp_tx)).is_err() {
                     break;
+                }
+
+                // Print all output for this turn, then loop back to read_line
+                while let Ok(msg) = resp_rx.recv() {
+                    print!("{msg}");
                 }
             }
             Ok(Signal::CtrlC) | Ok(Signal::CtrlD) => {

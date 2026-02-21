@@ -2944,20 +2944,20 @@ pub async fn run(
         println!("Type /help for commands.\n");
 
         let history_path = config.workspace_dir.join("history.txt");
-        let (mut repl_rx, repl_printer) = super::repl::Repl::spawn(history_path);
+        let mut repl_rx = super::repl::Repl::spawn(history_path);
 
         // Persistent conversation history across turns
         let mut history = vec![ChatMessage::system(&system_prompt)];
 
         while let Some(event) = repl_rx.recv().await {
-            let user_input = match event {
-                super::repl::ReplEvent::Line(line) => line,
+            let (user_input, resp_tx) = match event {
+                super::repl::ReplEvent::Line(line, tx) => (line, tx),
             };
 
             match user_input.as_str() {
                 "/quit" | "/exit" => break,
                 "/help" => {
-                    let _ = repl_printer.print("Available commands:\n  /help        Show this help message\n  /clear /new  Clear conversation history\n  /quit /exit  Exit interactive mode\n".to_string());
+                    let _ = resp_tx.send("Available commands:\n  /help        Show this help message\n  /clear /new  Clear conversation history\n  /quit /exit  Exit interactive mode\n".to_string());
                     continue;
                 }
                 "/clear" | "/new" => {
@@ -2974,12 +2974,11 @@ pub async fn run(
                             }
                         }
                     }
-                    let msg = if cleared > 0 {
-                        format!("Conversation cleared ({cleared} memory entries removed).\n")
+                    if cleared > 0 {
+                        let _ = resp_tx.send(format!("Conversation cleared ({cleared} memory entries removed).\n"));
                     } else {
-                        "Conversation cleared.\n".to_string()
-                    };
-                    let _ = repl_printer.print(msg);
+                        let _ = resp_tx.send("Conversation cleared.\n".to_string());
+                    }
                     continue;
                 }
                 _ => {}
@@ -3032,12 +3031,12 @@ pub async fn run(
             {
                 Ok(resp) => resp,
                 Err(e) => {
-                    let _ = repl_printer.print(format!("\nError: {e}\n"));
+                    let _ = resp_tx.send(format!("\nError: {e}\n"));
                     continue;
                 }
             };
             final_output = response.clone();
-            let _ = repl_printer.print(format!("\n{response}\n"));
+            let _ = resp_tx.send(format!("\n{response}\n"));
             observer.record_event(&ObserverEvent::TurnComplete);
 
             // Auto-compaction before hard trimming to preserve long-context signal.
@@ -3050,12 +3049,13 @@ pub async fn run(
             .await
             {
                 if compacted {
-                    let _ = repl_printer.print("🧹 Auto-compaction complete".to_string());
+                    let _ = resp_tx.send("🧹 Auto-compaction complete".to_string());
                 }
             }
 
             // Hard cap as a safety net.
             trim_history(&mut history, config.agent.max_history_messages);
+            // resp_tx drops here → reedline thread unblocks and shows next prompt
         }
     }
 
